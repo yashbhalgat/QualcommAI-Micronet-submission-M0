@@ -26,8 +26,8 @@ def get_model_complexity_info(model, input_res,
 
     if print_per_layer_stat:
         print_model_with_flops(flops_model, ost=ost)
-    flops_count = flops_model.compute_average_flops_cost()
-    params_count = get_model_parameters_number(flops_model)
+    flops_count = flops_model.compute_average_flops_cost(bw_weight=32, bw_act=32)
+    params_count = get_model_parameters_number(flops_model, bw_weight=32)
     flops_model.stop_flops_count()
 
     if as_strings:
@@ -105,32 +105,36 @@ def print_model_with_flops(model, units='GMac', precision=3, ost=sys.stdout):
 
 
 def get_model_parameters_number(model, bw_weight=4, w_strategy=None, print_layerwise=False):
-    """
-    w_strategy could be a list or dictionary - both are meant for variable bit-width cases
-    """
     numparams = 0
     quant_idx = 0
     for name, module in model.named_modules():
         if is_supported_instance(module):
             base_params = sum(p.numel() for p in module.parameters() if p.requires_grad)
             if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear)):
+                # following 4 lines take care of bit-mask overhead and sparsity when computing parameter count
+                numparams += module.weight.data.ne(0).float().sum().item() / 32.0  # bitmask overhead
+                base_params = module.weight.data.ne(0).float().sum().item()  # non-zero weight count
                 if isinstance(w_strategy, list):
-                    mod_params = base_params*w_strategy[quant_idx]/32.0
+                    mod_params = base_params * w_strategy[quant_idx] / 32.0
                     numparams += mod_params
                     quant_idx += 1
                 elif isinstance(w_strategy, dict):
                     if name in w_strategy:
-                        mod_params = base_params*w_strategy[name]/32.0
+                        mod_params = base_params * w_strategy[name] / 32.0
                     else:
-                        mod_params = base_params*bw_weight/32.0
+                        mod_params = base_params * bw_weight / 32.0
                     numparams += mod_params
-                elif w_strategy==None:
-                    mod_params = base_params*bw_weight/32.0
+                elif w_strategy == None:
+                    mod_params = base_params * bw_weight / 32.0
                     numparams += mod_params
+
+                if module.bias is not None:
+                    numparams += module.bias.data.numel()  # add bias count, bias is not quantized
+
             else:
                 mod_params = base_params
                 numparams += mod_params
-            
+
             if print_layerwise:
                 print(name, mod_params)
     return numparams
@@ -174,8 +178,7 @@ def compute_average_flops_cost(self, bw_weight=4, bw_act=4, strategy=(None, None
                     quant_idx += 1
                 elif isinstance(w_str, dict):
                     if name in w_str:
-                        # assuming weight bit-widths = activation bit-widths
-                        mod_flops = module.__flops__*max(w_str[name], w_str[name])/32.0
+                        mod_flops = module.__flops__*max(w_str[name], w_str[name])/32.0 # assuming bitwidth weight=act
                     else:
                         mod_flops = module.__flops__*max(bw_weight, bw_act)/32.0
                     flops_sum += mod_flops
@@ -278,7 +281,10 @@ def relu_flops_counter_hook(module, input, output):
 def linear_flops_counter_hook(module, input, output):
     input = input[0]
     batch_size = input.shape[0]
-    module.__flops__ += int(batch_size * input.shape[1] * output.shape[1])
+    nonzero_fraction = module.weight.data.ne(0).float().sum().item()/(input.shape[1] * output.shape[1])
+    n_elements = input.shape[1] * nonzero_fraction
+    module.__flops__ += int(batch_size * n_elements * output.shape[1])
+    module.__flops__ += int(batch_size * (n_elements-1) * output.shape[1])
 
 
 def pool_flops_counter_hook(module, input, output):
@@ -333,7 +339,12 @@ def conv_flops_counter_hook(conv_module, input, output):
     groups = conv_module.groups
 
     filters_per_channel = out_channels // groups
-    conv_per_position_flops = np.prod(kernel_dims) * in_channels * filters_per_channel
+
+    nonzero_fraction = conv_module.weight.data.ne(0).float().sum().item()/(np.prod(kernel_dims) * in_channels * filters_per_channel)
+
+    vector_length = np.prod(kernel_dims) * in_channels * nonzero_fraction
+    conv_per_position_flops = vector_length * filters_per_channel
+    conv_per_position_flops += (vector_length - 1) * filters_per_channel # number of additions
 
     active_elements_count = batch_size * np.prod(output_dims)
 
