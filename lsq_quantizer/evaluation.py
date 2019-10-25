@@ -5,7 +5,8 @@ from utils.data_loader import dataloader_imagenet
 from helpers import load_checkpoint
 from utils.utilities import get_constraint, eval_performance
 from utils.add_lsqmodule import add_lsqmodule
-
+from micronet_score import get_micronet_score
+import pdb
 
 def get_arguments():
     parser = argparse.ArgumentParser(description='Evaluation')
@@ -38,6 +39,10 @@ def main():
     load_checkpoint(net, name_weights_new)
 
     criterion = torch.nn.CrossEntropyLoss()
+
+    params_count, flops_count, score = get_micronet_score(net, args.weight_bits, args.activation_bits)
+    print(score)
+    pdb.set_trace()
 
     # Calculate accuracy
     net = net.cuda()

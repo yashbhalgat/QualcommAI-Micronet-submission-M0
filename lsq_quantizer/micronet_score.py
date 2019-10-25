@@ -36,4 +36,4 @@ def get_micronet_score(net, weight_bits, activation_bits, weight_strategy=None, 
 
     score = params_count/float(baseline_params) + flops_count/float(baseline_MAC)
 
-    return score
+    return params_count, flops_count, score
